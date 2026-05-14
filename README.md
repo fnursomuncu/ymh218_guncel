@@ -48,6 +48,7 @@ Bu proje, modern web teknolojileri kullanılarak geliştirilmiş, güvenli ve ö
 │   ├── index.html         # Ana HTML dosyası
 │   ├── package.json       # Bağımlılıklar ve scriptler
 │   └── vite.config.js     # Vite yapılandırması
+```
 
 ## 🚀 Kurulum ve Başlatma
 
