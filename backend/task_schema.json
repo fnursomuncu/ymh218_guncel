@@ -1,0 +1,92 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://gorev-yoneticisi.local/schemas/task.json",
+  "title": "Task",
+  "description": "Görev Yöneticisi - Görev veri yapısı (Person 2: Task & Data, Hafta 1)",
+  "type": "object",
+  "required": [
+    "id",
+    "title",
+    "description",
+    "priority",
+    "status",
+    "owner_id",
+    "title_updated_at",
+    "desc_updated_at"
+  ],
+  "properties": {
+    "id": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Sunucu tarafından atanan benzersiz görev kimliği"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000
+    },
+    "priority": {
+      "type": "string",
+      "enum": ["High", "Normal", "Low"],
+      "default": "Normal"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["To-Do", "In-Progress", "Completed"],
+      "default": "In-Progress"
+    },
+    "deadline": {
+      "type": ["string", "null"],
+      "format": "date",
+      "description": "ISO-8601 tarih (YYYY-MM-DD)"
+    },
+    "assigned_to": {
+      "type": ["string", "null"],
+      "maxLength": 120
+    },
+    "image_url": {
+      "type": ["string", "null"]
+    },
+    "owner_id": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "created_at": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "completed_at": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "title_updated_at": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Unix epoch saniyesi (CRDT/LWW için)"
+    },
+    "desc_updated_at": {
+      "type": "number",
+      "minimum": 0
+    },
+    "comments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "text", "task_id", "author_id"],
+        "properties": {
+          "id": { "type": "integer" },
+          "text": { "type": "string", "minLength": 1, "maxLength": 500 },
+          "task_id": { "type": "integer" },
+          "author_id": { "type": "integer" }
+        }
+      },
+      "default": []
+    }
+  },
+  "additionalProperties": false
+}

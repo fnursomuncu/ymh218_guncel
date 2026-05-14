@@ -1,0 +1,1984 @@
+PROJEKAT: GÖREV YÖNETİCİSİ (Full-Stack Code Capture)
+DATUM SPAJANJA: Thu May  7 12:32:46 CEST 2026
+
+############################################################
+
+
+
+////////////////////////////////////////////////////////////////////////////////
+/// FAJL: main.py
+////////////////////////////////////////////////////////////////////////////////
+
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form, Request
+from fastapi import WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
+from fastapi.security import OAuth2PasswordBearer
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+from jose import JWTError, jwt
+from pathlib import Path
+from uuid import uuid4
+import shutil
+import os
+import json
+
+import models
+import schemas
+import security
+from database import engine, get_db
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: dict):
+        for connection in self.active_connections:
+            await connection.send_json(message)
+
+manager = ConnectionManager()
+
+models.Base.metadata.create_all(bind=engine)
+app = FastAPI(title="Görev Yöneticisi API")
+
+# Jedan i jedini CORS blok koji ti treba
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+UPLOAD_DIR = Path("uploads")
+PROFILE_DIR = UPLOAD_DIR / "profiles"
+TASK_DIR = UPLOAD_DIR / "tasks"
+PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+TASK_DIR.mkdir(parents=True, exist_ok=True)
+
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+FIELD_LABELS = {
+    "username": "Kullanıcı adı",
+    "email": "E-posta",
+    "password": "Şifre",
+    "identifier": "Kullanıcı adı/e-posta",
+    "old_password": "Eski şifre",
+    "new_password": "Yeni şifre",
+    "confirm_password": "Şifre tekrarı",
+    "title": "Başlık",
+    "description": "Açıklama",
+    "text": "Yorum",
+    "file": "Dosya",
+}
+
+
+def save_upload(upload: UploadFile, target_dir: Path, prefix: str = "") -> str:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    suffix = Path(upload.filename or "").suffix
+    filename = f"{prefix}{uuid4().hex}{suffix}"
+    file_path = target_dir / filename
+
+    with file_path.open("wb") as buffer:
+        shutil.copyfileobj(upload.file, buffer)
+
+    return f"/uploads/{target_dir.name}/{filename}"
+
+
+def delete_local_file(file_url: str | None):
+    if not file_url:
+        return
+    local_path = file_url.lstrip("/")
+    if os.path.exists(local_path):
+        try:
+            os.remove(local_path)
+        except OSError:
+            pass
+
+
+def translate_validation_error(error: dict) -> str:
+    loc = error.get("loc") or []
+    field = next((x for x in reversed(loc) if x != "body"), None)
+    label = FIELD_LABELS.get(field, "Alan")
+    err_type = error.get("type", "")
+    ctx = error.get("ctx") or {}
+
+    if err_type == "missing":
+        return f"{label} zorunludur."
+    if field == "email":
+        return "Geçerli bir e-posta adresi girin."
+    if field == "identifier":
+        if err_type == "string_too_short":
+            return "Kullanıcı adı/e-posta en az 3 karakter olmalı."
+        return "Kullanıcı adı/e-posta geçersiz."
+    if field == "username":
+        if err_type == "string_too_short":
+            return f"Kullanıcı adı en az {ctx.get('min_length', 3)} karakter olmalı."
+        if err_type == "string_too_long":
+            return f"Kullanıcı adı en fazla {ctx.get('max_length', 30)} karakter olabilir."
+        return "Kullanıcı adı geçersiz."
+    if field in {"password", "new_password"}:
+        return security.PASSWORD_POLICY_MESSAGE
+    if field in {"old_password", "confirm_password"}:
+        if err_type == "string_too_short":
+            return f"{label} en az {ctx.get('min_length', 1)} karakter olmalı."
+        return f"{label} geçersiz."
+    if field == "title":
+        if err_type == "string_too_short":
+            return "Başlık boş olamaz."
+        return "Başlık geçersiz."
+    return error.get("msg", "Gönderilen veriler geçersiz.")
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    messages = []
+    for error in exc.errors():
+        msg = translate_validation_error(error)
+        if msg not in messages:
+            messages.append(msg)
+
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": " ".join(messages)},
+    )
+
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Oturum süresi doldu, lütfen tekrar giriş yapın.",
+    )
+    try:
+        payload = jwt.decode(token, security.SECRET_KEY, algorithms=[security.ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+
+    user = db.query(models.User).filter(models.User.username == username).first()
+    if user is None:
+        raise credentials_exception
+    return user
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            # İstemciden veri geldiğinde (örneğin bir task güncellendiğinde) bunu dinle
+            data = await websocket.receive_text()
+            
+            # Gelen veriyi güvenli bir şekilde JSON formatına çevir
+            try:
+                parsed_data = json.loads(data)
+                # Gelen değişikliği diğer tüm aktif bağlantılara ilet
+                await manager.broadcast({"type": "update", "payload": parsed_data})
+            except json.JSONDecodeError:
+                 pass # Gelen veri JSON değilse yoksay
+            
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
+@app.post("/register", response_model=schemas.UserResponse)
+def register(user: schemas.UserCreate, db: Session = Depends(get_db)):
+    username = user.username.strip()
+    email = user.email.strip().lower()
+
+    existing_user = db.query(models.User).filter(
+        (models.User.username == username) | (func.lower(models.User.email) == email)
+    ).first()
+
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Bu kullanıcı adı veya e-posta zaten kullanımda."
+        )
+
+    hashed_pw = security.get_password_hash(user.password)
+    new_user = models.User(
+        username=username,
+        email=email,
+        hashed_password=hashed_pw
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    return new_user
+
+
+@app.post("/login", response_model=schemas.Token)
+def login(user_data: schemas.UserLogin, db: Session = Depends(get_db)):
+    identifier = user_data.identifier.strip()
+    email_like = identifier.lower()
+
+    user = db.query(models.User).filter(
+        (models.User.username == identifier) | (func.lower(models.User.email) == email_like)
+    ).first()
+
+    if not user or not security.verify_password(user_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Kullanıcı adı/e-posta veya şifre hatalı."
+        )
+
+    token = security.create_access_token(data={"sub": user.username})
+    return {"access_token": token, "token_type": "bearer"}
+
+
+@app.get("/users/me", response_model=schemas.UserResponse)
+def get_me(current_user: models.User = Depends(get_current_user)):
+    return current_user
+
+
+@app.post("/users/me/profile-pic")
+def upload_profile_pic(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    if file.content_type and not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Sadece görsel dosyaları yükleyebilirsiniz.")
+
+    if current_user.profile_pic:
+        delete_local_file(current_user.profile_pic)
+
+    image_url = save_upload(file, PROFILE_DIR, prefix=f"profile_{current_user.id}_")
+    current_user.profile_pic = image_url
+    db.commit()
+
+    return {"path": image_url, "msg": "Profil fotoğrafı yüklendi."}
+
+
+@app.delete("/users/me/profile-pic")
+def delete_profile_pic(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    delete_local_file(current_user.profile_pic)
+    current_user.profile_pic = None
+    db.commit()
+    return {"msg": "Profil fotoğrafı kaldırıldı."}
+
+
+@app.post("/users/me/change-password")
+def change_password(
+    data: schemas.PasswordChange,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    if not security.verify_password(data.old_password, current_user.hashed_password):
+        raise HTTPException(status_code=400, detail="Eski şifre hatalı.")
+
+    if data.new_password != data.confirm_password:
+        raise HTTPException(status_code=400, detail="Yeni şifreler eşleşmiyor.")
+
+    if not security.is_password_strong(data.new_password):
+        raise HTTPException(status_code=400, detail=security.PASSWORD_POLICY_MESSAGE)
+
+    current_user.hashed_password = security.get_password_hash(data.new_password)
+    db.commit()
+    return {"msg": "Şifre başarıyla güncellendi."}
+
+
+@app.get("/tasks", response_model=list[schemas.TaskResponse])
+def get_tasks(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    return (
+        db.query(models.Task)
+        .filter(models.Task.owner_id == current_user.id)
+        .order_by(models.Task.id.desc())
+        .all()
+    )
+
+
+@app.post("/tasks", response_model=schemas.TaskResponse)
+def create_task(
+    title: str = Form(...),
+    description: str = Form(...),
+    # OVDJE DODAJEMO FATMINA POLJA KAO FORMU
+    priority: str = Form("Normal"),
+    status: str = Form("In-Progress"),
+    deadline: str = Form(""),
+    assigned_to: str = Form(""),
+    title_at: float = Form(...), 
+    desc_at: float = Form(...),
+    file: UploadFile | None = File(None),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    image_url = None
+    if file and file.filename:
+        image_url = save_upload(file, TASK_DIR, prefix=f"task_{current_user.id}_")
+
+    new_task = models.Task(
+        title=title.strip(),
+        description=description.strip(),
+        priority=priority,
+        status=status,
+        deadline=deadline if deadline else None,
+        assigned_to=assigned_to.strip() if assigned_to else None,
+        title_updated_at=title_at,
+        desc_updated_at=desc_at,
+        image_url=image_url,
+        owner_id=current_user.id
+    )
+    db.add(new_task)
+    db.commit()
+    db.refresh(new_task)
+    return new_task
+
+@app.post("/tasks/sync", response_model=schemas.TaskResponse)
+def sync_task(incoming: schemas.TaskSync, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    db_task = db.query(models.Task).filter(models.Task.id == incoming.id, models.Task.owner_id == current_user.id).first()
+    if not db_task:
+        raise HTTPException(status_code=404, detail="Görev bulunamadı.")
+
+    # Alan bazlı LWW Çakışma Yönetimi (Conflict Resolution)
+    updated = False
+    if incoming.title_updated_at > db_task.title_updated_at:
+        db_task.title = incoming.title
+        db_task.title_updated_at = incoming.title_updated_at
+        # Ako se ažurira generalno, ažurirajmo i Fatmina polja
+        db_task.priority = incoming.priority
+        db_task.status = incoming.status
+        db_task.deadline = incoming.deadline
+        db_task.assigned_to = incoming.assigned_to
+        updated = True
+    
+    if incoming.desc_updated_at > db_task.desc_updated_at:
+        db_task.description = incoming.description
+        db_task.desc_updated_at = incoming.desc_updated_at
+        updated = True
+
+    if updated:
+        db.commit()
+        db.refresh(db_task)
+    return db_task
+
+
+@app.delete("/tasks/{task_id}")
+def delete_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    task = db.query(models.Task).filter(models.Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Görev bulunamadı.")
+    if task.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Yetkisiz işlem.")
+
+    delete_local_file(task.image_url)
+    db.delete(task)
+    db.commit()
+    return {"msg": "Görev silindi."}
+
+
+@app.post("/comments", response_model=schemas.CommentResponse)
+def add_comment(
+    comment: schemas.CommentCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    task = db.query(models.Task).filter(
+        models.Task.id == comment.task_id,
+        models.Task.owner_id == current_user.id
+    ).first()
+
+    if not task:
+        raise HTTPException(status_code=404, detail="Görev bulunamadı.")
+
+    comment_text = comment.text.strip()
+    if not comment_text:
+        raise HTTPException(status_code=400, detail="Yorum boş olamaz.")
+
+    new_comment = models.Comment(
+        text=comment_text,
+        task_id=comment.task_id,
+        author_id=current_user.id
+    )
+    db.add(new_comment)
+    db.commit()
+    db.refresh(new_comment)
+    return new_comment
+
+////////////////////////////////////////////////////////////////////////////////
+/// FAJL: schemas.py
+////////////////////////////////////////////////////////////////////////////////
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from typing import Optional, List
+import datetime
+import re
+
+from security import is_password_strong, PASSWORD_POLICY_MESSAGE
+
+EMAIL_PATTERN = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
+USERNAME_PATTERN = r"^[A-Za-z0-9_.-]+$"
+
+
+class UserCreate(BaseModel):
+    username: str = Field(min_length=3, max_length=30)
+    email: str = Field(min_length=5, max_length=254)
+    password: str = Field(min_length=8, max_length=128)
+
+    @field_validator("username", "email", "password", mode="before")
+    @classmethod
+    def strip_strings(cls, v):
+        if isinstance(v, str):
+            return v.strip()
+        return v
+
+    @field_validator("username")
+    @classmethod
+    def validate_username(cls, v):
+        if not re.fullmatch(USERNAME_PATTERN, v):
+            raise ValueError("Kullanıcı adı sadece harf, rakam, nokta, alt çizgi ve kısa çizgi içerebilir.")
+        return v
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, v):
+        if not re.fullmatch(EMAIL_PATTERN, v):
+            raise ValueError("Geçerli bir e-posta adresi girin.")
+        return v.lower()
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, v):
+        if not is_password_strong(v):
+            raise ValueError(PASSWORD_POLICY_MESSAGE)
+        return v
+
+
+class UserResponse(BaseModel):
+    id: int
+    username: str
+    email: str
+    profile_pic: Optional[str] = None
+    created_at: datetime.datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
+class UserLogin(BaseModel):
+    identifier: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=1, max_length=128)
+
+    @field_validator("identifier", "password", mode="before")
+    @classmethod
+    def strip_strings(cls, v):
+        if isinstance(v, str):
+            return v.strip()
+        return v
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+
+class PasswordChange(BaseModel):
+    old_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+    confirm_password: str = Field(min_length=8, max_length=128)
+
+    @field_validator("old_password", "new_password", "confirm_password", mode="before")
+    @classmethod
+    def strip_strings(cls, v):
+        if isinstance(v, str):
+            return v.strip()
+        return v
+
+    @field_validator("new_password")
+    @classmethod
+    def validate_new_password(cls, v):
+        if not is_password_strong(v):
+            raise ValueError(PASSWORD_POLICY_MESSAGE)
+        return v
+
+
+class CommentCreate(BaseModel):
+    text: str = Field(min_length=1, max_length=500)
+    task_id: int
+
+    @field_validator("text", mode="before")
+    @classmethod
+    def strip_text(cls, v):
+        if isinstance(v, str):
+            return v.strip()
+        return v
+
+class CommentResponse(BaseModel):
+    id: int
+    text: str
+    task_id: int
+    author_id: int
+    model_config = ConfigDict(from_attributes=True)
+
+class TaskBase(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+    description: str = Field(min_length=1, max_length=2000)
+    
+    # NOVA POLJA (Opciona su kako ne bi srušila stare zadatke koji ih nemaju)
+    priority: Optional[str] = "Normal"
+    status: Optional[str] = "In-Progress"
+    deadline: Optional[str] = None
+    assigned_to: Optional[str] = None
+
+    title_updated_at: float 
+    desc_updated_at: float
+
+class TaskCreate(TaskBase):
+    pass
+
+class TaskSync(TaskBase):
+    id: int 
+
+class TaskResponse(TaskSync):
+    image_url: Optional[str] = None
+    owner_id: int
+    # Yorumlar liste olarak döner
+    comments: List['CommentResponse'] = []
+    model_config = ConfigDict(from_attributes=True)
+
+////////////////////////////////////////////////////////////////////////////////
+/// FAJL: database.py
+////////////////////////////////////////////////////////////////////////////////
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+
+# Koristimo SQLite jer je jednostavniji za debug (pravi fajl test.db)
+SQLALCHEMY_DATABASE_URL = "sqlite:///./test.db"
+
+engine = create_engine(
+    SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
+)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+Base = declarative_base()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+////////////////////////////////////////////////////////////////////////////////
+/// FAJL: security.py
+////////////////////////////////////////////////////////////////////////////////
+
+from datetime import datetime, timedelta, timezone
+from passlib.context import CryptContext
+from jose import jwt
+import re
+import hashlib
+import os
+
+SECRET_KEY = os.getenv("SECRET_KEY", "DEV_ONLY_SECRET_KEY_CHANGE_ME")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+pwd_context = CryptContext(
+    schemes=["bcrypt"],
+    deprecated="auto"
+)
+
+PASSWORD_POLICY_MESSAGE = (
+    "Şifre en az 8 karakter olmalı; 1 büyük harf, 1 küçük harf, 1 rakam "
+    "ve 1 özel karakter içermelidir."
+)
+
+PASSWORD_PATTERN = r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^a-zA-Z0-9]).{8,}$"
+
+
+def is_password_strong(password: str) -> bool:
+    return bool(re.match(PASSWORD_PATTERN, password))
+
+
+def get_password_hash(password: str) -> str:
+    password_bytes = password.encode("utf-8")
+
+    if len(password_bytes) > 72:
+        password = hashlib.sha256(password_bytes).hexdigest()
+
+    return pwd_context.hash(password)
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    password_bytes = plain_password.encode("utf-8")
+
+    if len(password_bytes) > 72:
+        plain_password = hashlib.sha256(password_bytes).hexdigest()
+
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def create_access_token(data: dict) -> str:
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + timedelta(
+        minutes=ACCESS_TOKEN_EXPIRE_MINUTES
+    )
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+////////////////////////////////////////////////////////////////////////////////
+/// FAJL: ../frontend/src/App.jsx
+////////////////////////////////////////////////////////////////////////////////
+
+import { useEffect, useRef, useState } from 'react';
+import './App.css';
+import { Toaster, toast } from 'react-hot-toast';
+
+const API_BASE = 'http://127.0.0.1:8000';
+const PASSWORD_POLICY = 'Şifre en az 8 karakter olmalı; 1 büyük harf, 1 küçük harf, 1 rakam ve 1 özel karakter içermelidir.';
+
+// --- CRDT MERGE FONKSİYONU (Popravljeno za brisanje) ---
+const mergeTasks = (localTasks, incomingTasks) => {
+  const localMap = new Map(localTasks.map(t => [t.id, t]));
+
+  // Sada prolazimo SAMO kroz zadatke koji su zaista stigli sa backenda
+  return incomingTasks.map(incoming => {
+    if (localMap.has(incoming.id)) {
+      const local = localMap.get(incoming.id);
+      const merged = { ...local };
+
+      // LWW (Last-Write-Wins) Mantığı
+      if (incoming.title_updated_at > (local.title_updated_at || 0)) {
+        merged.title = incoming.title;
+        merged.title_updated_at = incoming.title_updated_at;
+        merged.priority = incoming.priority;
+        merged.status = incoming.status;
+        merged.deadline = incoming.deadline;
+        merged.assigned_to = incoming.assigned_to;
+      }
+      if (incoming.desc_updated_at > (local.desc_updated_at || 0)) {
+        merged.description = incoming.description;
+        merged.desc_updated_at = incoming.desc_updated_at;
+      }
+      
+      merged.image_url = incoming.image_url;
+      merged.comments = incoming.comments;
+      return merged;
+    } else {
+      // Ako je zadatak potpuno nov, samo ga dodaj
+      return incoming;
+    }
+  }).sort((a, b) => b.id - a.id);
+};
+
+function App() {
+  const [currentView, setCurrentView] = useState('login');
+  const [isDarkMode, setIsDarkMode] = useState(() => localStorage.getItem('theme') === 'dark');
+  
+  // Auth state
+  const [loginIdentifier, setLoginIdentifier] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [loginShowPassword, setLoginShowPassword] = useState(false);
+  const [loginError, setLoginError] = useState('');
+  const [regUsername, setRegUsername] = useState('');
+  const [regEmail, setRegEmail] = useState('');
+  const [regPassword, setRegPassword] = useState('');
+  const [regConfirmPassword, setRegConfirmPassword] = useState('');
+  const [regError, setRegError] = useState('');
+  const [showRegPass, setShowRegPass] = useState(false);
+  const [showConfirmPass, setShowConfirmPass] = useState(false);
+
+  // Task state (NOVA POLJA DODANA OVDJE)
+  const [taskTitle, setTaskTitle] = useState('');
+  const [taskDesc, setTaskDesc] = useState('');
+  const [taskPriority, setTaskPriority] = useState('Normal'); // Default
+  const [taskDeadline, setTaskDeadline] = useState('');
+  const [taskAssignedTo, setTaskAssignedTo] = useState('');
+  const [taskFile, setTaskFile] = useState(null);
+  const [taskMessage, setTaskMessage] = useState({ text: '', type: '' });
+  const [tasksList, setTasksList] = useState([]);
+  const [commentDrafts, setCommentDrafts] = useState({});
+  const socketRef = useRef(null);
+  const [isWsConnected, setIsWsConnected] = useState(false);
+
+  // Profile & Edit State
+  const [userData, setUserData] = useState(null);
+  const [oldPass, setOldPass] = useState('');
+  const [newPass, setNewPass] = useState('');
+  const [confirmNewPass, setConfirmNewPass] = useState('');
+  const [showOldPass, setShowOldPass] = useState(false);
+  const [showNewPass, setShowNewPass] = useState(false);
+  const [showConfirmNewPass, setShowConfirmNewPass] = useState(false);
+  const [passMessage, setPassMessage] = useState({ text: '', type: '' });
+  
+  const [profileFile, setProfileFile] = useState(null);
+  const [profileMessage, setProfileMessage] = useState({ text: '', type: '' });
+
+  const [editingTaskId, setEditingTaskId] = useState(null);
+  const [editTitle, setEditTitle] = useState('');
+  const [editDesc, setEditDesc] = useState('');
+  const [editPriority, setEditPriority] = useState('');
+  const [editDeadline, setEditDeadline] = useState('');
+  const [editAssignedTo, setEditAssignedTo] = useState('');
+
+  const taskFileRef = useRef(null);
+  const profileFileRef = useRef(null);
+
+  const toggleTheme = () => setIsDarkMode((prev) => !prev);
+
+  useEffect(() => {
+    localStorage.setItem('theme', isDarkMode ? 'dark' : 'light');
+    document.body.classList.toggle('dark-theme', isDarkMode);
+  }, [isDarkMode]);
+
+// LOGIN KONTROL 
+  useEffect(() => {
+    const token = localStorage.getItem('token');
+    if (token) {
+      fetchUserData().then(success => {
+        if (success) {
+          setCurrentView('dashboard');
+        } else {
+          localStorage.removeItem('token');
+          setCurrentView('login');
+        }
+      });
+    }
+  }, []);
+
+  const readError = async (res, fallback) => {
+    try {
+      const data = await res.json();
+      if (Array.isArray(data?.detail)) {
+        return data.detail.map((item) => (typeof item === 'string' ? item : item?.msg)).filter(Boolean).join('\n');
+      }
+      if (typeof data?.detail === 'string') return data.detail;
+      return fallback;
+    } catch { return fallback; }
+  };
+
+  const formatUrl = (path) => path ? `${API_BASE}${path.startsWith('/') ? path : `/${path}`}` : '';
+  const authHeaders = () => {
+    const token = localStorage.getItem('token');
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  };
+
+  const getPasswordIssues = (password) => {
+    const issues = [];
+    if ((password || '').length < 8) issues.push('En az 8 karakter');
+    if (!/[A-Z]/.test(password || '')) issues.push('1 büyük harf eksik');
+    if (!/[a-z]/.test(password || '')) issues.push('1 küçük harf eksik');
+    if (!/\d/.test(password || '')) issues.push('1 rakam eksik');
+    if (!/[^A-Za-z0-9]/.test(password || '')) issues.push('1 özel karakter eksik');
+    return issues;
+  };
+
+  const fetchUserData = async () => {
+    const res = await fetch(`${API_BASE}/users/me`, { headers: authHeaders() });
+    if (res.ok) {
+      const data = await res.json();
+      setUserData(data);
+      return true;
+    }
+    if (res.status === 401) logout();
+    return false;
+  };
+
+  const fetchTasks = async () => {
+    const res = await fetch(`${API_BASE}/tasks`, { headers: authHeaders() });
+    if (res.ok) {
+      const data = await res.json();
+      setTasksList((prev) => mergeTasks(prev, data));
+      return true;
+    }
+    return false;
+  };
+
+  const fetchAll = async () => {
+    const token = localStorage.getItem('token');
+    if (!token) return;
+    try {
+      await Promise.all([fetchTasks(), fetchUserData()]);
+    } catch (e) {
+      setTaskMessage({ text: 'Sunucuya bağlanılamadı.', type: 'error' });
+    }
+  };
+
+  useEffect(() => {
+    if (currentView === 'dashboard' || currentView === 'profile') void fetchAll();
+  }, [currentView]);
+
+  // Yeni Eklenen WebSocket useEffect'i
+// Yeni Eklenen WebSocket useEffect'i
+  useEffect(() => {
+    if (currentView !== 'dashboard' && currentView !== 'profile') return;
+
+    const wsUrl = API_BASE.replace('http', 'ws') + '/ws';
+    const socket = new WebSocket(wsUrl);
+    socketRef.current = socket;
+
+    socket.onopen = () => {
+      console.log('WebSocket Bağlantısı Açıldı');
+      setIsWsConnected(true);
+    };
+
+    socket.onmessage = (event) => {
+      try {
+        const message = JSON.parse(event.data);
+        if (message.type === 'update') {
+          // Gelen mesajda bir 'action' varsa ve bu action 'task_changed' ise
+          if (message.payload && message.payload.action === 'task_changed') {
+              // Görevleri yenile
+              fetchTasks();
+              
+              // Herhangi bir temada güzel görünen standart başarılı bildirimini göster
+              toast.success('Bir görev güncellendi!', {
+                  duration: 4000,
+                  position: 'bottom-right',
+              });
+          }
+        }
+      } catch (e) {
+        console.error('Mesaj işlenirken hata:', e);
+      }
+    };
+
+    socket.onclose = () => {
+      console.log('WebSocket Bağlantısı Kapatıldı');
+      setIsWsConnected(false);
+    };
+
+    return () => {
+      socket.close();
+    };
+  }, [currentView]);
+
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    setLoginError('');
+    if (!loginIdentifier.trim() || !loginPassword) {
+      setLoginError('Kullanıcı adı/e-posta ve şifre zorunludur.');
+      return;
+    }
+    const res = await fetch(`${API_BASE}/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ identifier: loginIdentifier.trim(), password: loginPassword }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      localStorage.setItem('token', data.access_token);
+      setCurrentView('dashboard');
+      return;
+    }
+    setLoginError(await readError(res, 'Giriş başarısız.'));
+  };
+
+  const handleRegister = async (e) => {
+    e.preventDefault();
+    setRegError('');
+    if (!regUsername.trim() || !regEmail.trim() || !regPassword || !regConfirmPassword) {
+      setRegError('Tüm alanlar zorunludur.'); return;
+    }
+    if (regPassword !== regConfirmPassword) {
+      setRegError('Şifreler eşleşmiyor.'); return;
+    }
+    const issues = getPasswordIssues(regPassword);
+    if (issues.length > 0) {
+      setRegError(`${PASSWORD_POLICY}\n${issues.join('\n')}`); return;
+    }
+    const res = await fetch(`${API_BASE}/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: regUsername.trim(), email: regEmail.trim().toLowerCase(), password: regPassword }),
+    });
+    if (res.ok) { setCurrentView('login'); return; }
+    setRegError(await readError(res, 'Kayıt başarısız.'));
+  };
+
+  // Yardımcı Fonksiyon: WebSocket üzerinden değişiklik bildirimi gönder
+  const notifyTaskChange = () => {
+    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+      socketRef.current.send(JSON.stringify({ action: "task_changed" }));
+    }
+  };
+
+  // KREIRANJE ZADATKA SA NOVIM POLJIMA
+  const handleCreateTask = async (e) => {
+    e.preventDefault();
+    setTaskMessage({ text: '', type: '' });
+    
+    const formData = new FormData();
+    formData.append('title', taskTitle.trim());
+    formData.append('description', taskDesc.trim());
+    formData.append('priority', taskPriority);
+    formData.append('status', 'In-Progress');
+    formData.append('deadline', taskDeadline);
+    formData.append('assigned_to', taskAssignedTo.trim());
+    formData.append('title_at', Date.now() / 1000);
+    formData.append('desc_at', Date.now() / 1000);
+    if (taskFile) formData.append('file', taskFile);
+
+    const res = await fetch(`${API_BASE}/tasks`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: formData,
+    });
+    if (res.ok) {
+      setTaskTitle(''); setTaskDesc(''); setTaskDeadline(''); setTaskAssignedTo(''); setTaskPriority('Normal'); setTaskFile(null);
+      if(taskFileRef.current) taskFileRef.current.value = "";
+      setTaskMessage({ text: 'Görev başarıyla kaydedildi.', type: 'success' });
+      void fetchTasks();
+      notifyTaskChange(); // Websocket ile eklendi
+    }
+  };
+
+  const handleUpdateTask = async (taskId, updatedData) => {
+    const now = Date.now() / 1000;
+    const finalData = {
+      id: taskId,
+      ...updatedData,
+      title_updated_at: now,
+      desc_updated_at: now
+    };
+
+    const res = await fetch(`${API_BASE}/tasks/sync`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify(finalData),
+    });
+
+    if (res.ok) {
+      void fetchTasks();
+      notifyTaskChange();  // Websocket ile eklendi
+    }
+  };
+
+  // BRZA PROMJENA STATUSA (Fatmin zahtjev: "Tamamlandi")
+  const handleMarkCompleted = (task) => {
+      handleUpdateTask(task.id, {
+          title: task.title,
+          description: task.description,
+          priority: task.priority,
+          deadline: task.deadline,
+          assigned_to: task.assigned_to,
+          status: 'Completed'
+      });
+  }
+
+  const handleDeleteTask = async (taskId) => {
+    const res = await fetch(`${API_BASE}/tasks/${taskId}`, { method: 'DELETE', headers: authHeaders() });
+    if (res.ok) 
+      void fetchTasks();
+    notifyTaskChange();   // Websocket ile eklendi
+  };
+
+  const handleAddComment = async (taskId) => {
+    const text = (commentDrafts[taskId] || '').trim();
+    if (!text) return;
+    const res = await fetch(`${API_BASE}/comments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify({ text, task_id: taskId }),
+    });
+    if (res.ok) {
+      setCommentDrafts((prev) => ({ ...prev, [taskId]: '' }));
+      void fetchTasks();
+    }
+  };
+
+  // LOGIKA ZA PROFIL - SLIKA
+  const handleProfilePicUpload = async (e) => {
+      e.preventDefault();
+      if (!profileFile) return;
+      const formData = new FormData();
+      formData.append('file', profileFile);
+      const res = await fetch(`${API_BASE}/users/me/profile-pic`, {
+          method: 'POST',
+          headers: authHeaders(),
+          body: formData
+      });
+      if (res.ok) {
+          setProfileMessage({text: 'Profil fotoğrafı güncellendi.', type: 'success'});
+          setProfileFile(null);
+          if(profileFileRef.current) profileFileRef.current.value = "";
+          fetchUserData();
+      } else {
+          setProfileMessage({text: 'Fotoğraf yüklenemedi.', type: 'error'});
+      }
+  };
+
+  const handleProfilePicDelete = async () => {
+      const res = await fetch(`${API_BASE}/users/me/profile-pic`, {
+          method: 'DELETE',
+          headers: authHeaders()
+      });
+      if (res.ok) {
+          setProfileMessage({text: 'Profil fotoğrafı silindi.', type: 'success'});
+          fetchUserData();
+      }
+  };
+
+  // LOGIKA ZA PROFIL - LOZINKA
+  const handlePasswordChange = async (e) => {
+      e.preventDefault();
+      setPassMessage({text:'', type:''});
+      if(newPass !== confirmNewPass) {
+          setPassMessage({text: 'Yeni şifreler eşleşmiyor!', type: 'error'});
+          return;
+      }
+      const issues = getPasswordIssues(newPass);
+      if(issues.length > 0) {
+          setPassMessage({text: 'Şifre zayıf. Kuralları kontrol edin.', type: 'error'});
+          return;
+      }
+      const res = await fetch(`${API_BASE}/users/me/change-password`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json', ...authHeaders()},
+          body: JSON.stringify({
+              old_password: oldPass,
+              new_password: newPass,
+              confirm_password: confirmNewPass
+          })
+      });
+      if(res.ok) {
+          setPassMessage({text: 'Şifreniz başarıyla değiştirildi!', type: 'success'});
+          setOldPass(''); setNewPass(''); setConfirmNewPass('');
+      } else {
+          const errMsg = await readError(res, 'Şifre değiştirilemedi.');
+          setPassMessage({text: errMsg, type: 'error'});
+      }
+  };
+
+  const logout = () => {
+    localStorage.removeItem('token');
+    setTasksList([]); setUserData(null); setCurrentView('login');
+  };
+
+  const currentPasswordIssues = getPasswordIssues(regPassword);
+  const newPasswordIssues = getPasswordIssues(newPass);
+
+  return (
+    <div className="app-container">
+      <Toaster position="bottom-right" reverseOrder={false} />   
+      <div className="theme-toggle-wrapper">
+        <button className="toggle-btn" onClick={toggleTheme}>
+          {isDarkMode ? '☀️ Aydınlık Mod' : '🌙 Karanlık Mod'}
+        </button>
+      </div>
+      <h1 className="main-title">Görev Yöneticisi {/* Bağlantı durumu göstergesi eklendi */}
+        {(currentView === 'dashboard' || currentView === 'profile') && (
+          <span 
+            title={isWsConnected ? "Gerçek zamanlı bağlı" : "Bağlantı koptu"}
+            style={{
+              display: 'inline-block',
+              width: '12px',
+              height: '12px',
+              borderRadius: '50%',
+              marginLeft: '15px',
+              backgroundColor: isWsConnected ? '#4caf50' : '#f44336'
+            }}
+          />
+        )}</h1>
+
+      {currentView === 'login' && (
+        <div className="auth-card auth-panel">
+          <div className="auth-top">
+            <div>
+              <h2>Giriş Yap</h2>
+              <p className="muted-text">Yetkili erişim için kullanıcı adı/e-posta ve şifre girin.</p>
+            </div>
+          </div>
+          {loginError && <div className="message-box error">{loginError}</div>}
+          <form onSubmit={handleLogin}>
+            <div className="form-group">
+              <label>Kullanıcı Adı veya E-posta</label>
+              <input className="form-input" value={loginIdentifier} onChange={(e) => setLoginIdentifier(e.target.value)} placeholder="Ad veya e-posta" />
+            </div>
+            <div className="form-group">
+              <label>Şifre</label>
+              <div className="field-with-toggle">
+                <input type={loginShowPassword ? 'text' : 'password'} className="form-input" value={loginPassword} onChange={(e) => setLoginPassword(e.target.value)} placeholder="Şifrenizi girin" />
+                <button type="button" className="toggle-eye-btn" onClick={() => setLoginShowPassword((prev) => !prev)}>
+                  {loginShowPassword ? '🔒' : '👁️'}
+                </button>
+              </div>
+            </div>
+            <button className="btn-primary">Giriş Yap</button>
+          </form>
+          <button type="button" className="link-button" onClick={() => setCurrentView('register')}>Kayıt Ol</button>
+        </div>
+      )}
+
+      {currentView === 'register' && (
+        <div className="auth-card auth-panel">
+          <div className="auth-top">
+            <div>
+              <h2>Kayıt Ol</h2>
+              <p className="muted-text">Şifre kuralları sistem tarafından kontrol edilir.</p>
+            </div>
+          </div>
+          {regError && <div className="message-box error" style={{ whiteSpace: 'pre-line' }}>{regError}</div>}
+          <form onSubmit={handleRegister}>
+            <div className="form-group">
+              <label>Kullanıcı Adı</label>
+              <input className="form-input" value={regUsername} onChange={(e) => setRegUsername(e.target.value)} placeholder="Adınız" />
+            </div>
+            <div className="form-group">
+              <label>E-posta</label>
+              <input type="email" className="form-input" value={regEmail} onChange={(e) => setRegEmail(e.target.value)} placeholder="ornek@mail.com" />
+            </div>
+            <div className="form-group">
+              <label>Şifre</label>
+              <div className="field-with-toggle">
+                <input type={showRegPass ? 'text' : 'password'} className="form-input" value={regPassword} onChange={(e) => setRegPassword(e.target.value)} placeholder="En az 8 karakter" />
+                <button type="button" className="toggle-eye-btn" onClick={() => setShowRegPass((prev) => !prev)}>{showRegPass ? '🔒' : '👁️'}</button>
+              </div>
+              <div className="field-hint" style={{ marginTop: '8px', fontSize: '0.9em' }}>
+                {regPassword.length > 0 && currentPasswordIssues.length > 0 ? (
+                  <ul style={{ margin: 0, paddingLeft: '20px', color: '#d9534f' }}>
+                    {currentPasswordIssues.map((issue, idx) => <li key={idx}>{issue}</li>)}
+                  </ul>
+                ) : regPassword.length === 0 ? (
+                  <span style={{ color: '#6c757d' }}>{PASSWORD_POLICY}</span>
+                ) : (
+                  <span style={{ color: '#28a745', fontWeight: 'bold' }}>Şifre uygun!</span>
+                )}
+              </div>
+            </div>
+            <div className="form-group">
+              <label>Şifre Tekrar</label>
+              <div className="field-with-toggle">
+                <input type={showConfirmPass ? 'text' : 'password'} className="form-input" value={regConfirmPassword} onChange={(e) => setRegConfirmPassword(e.target.value)} placeholder="Şifreyi tekrar girin" />
+                <button type="button" className="toggle-eye-btn" onClick={() => setShowConfirmPass((prev) => !prev)}>{showConfirmPass ? '🔒' : '👁️'}</button>
+              </div>
+            </div>
+            <button className="btn-primary">Kaydı Tamamla</button>
+          </form>
+          <button type="button" className="link-button" onClick={() => setCurrentView('login')}>Geri Dön</button>
+        </div>
+      )}
+
+      {(currentView === 'dashboard' || currentView === 'profile') && (
+        <div className="dashboard-wrapper">
+          <nav className="nav-header">
+            <div className="nav-buttons">
+              <button onClick={() => setCurrentView('dashboard')} className={`nav-btn ${currentView === 'dashboard' ? 'active' : ''}`}>Panel</button>
+              <button onClick={() => setCurrentView('profile')} className={`nav-btn ${currentView === 'profile' ? 'active' : ''}`}>Profilim</button>
+            </div>
+            <button onClick={logout} className="logout-btn">Çıkış Yap</button>
+          </nav>
+
+          {currentView === 'dashboard' ? (
+            <>
+              <div className="action-grid single-panel">
+                <div className="action-box wide-box">
+                  <h3>Yeni Görev</h3>
+                  {taskMessage.text && <div className={`message-box ${taskMessage.type}`}>{taskMessage.text}</div>}
+                  <form onSubmit={handleCreateTask}>
+                    <div className="form-group">
+                      <label>Başlık</label>
+                      <input className="form-input" value={taskTitle} onChange={(e) => setTaskTitle(e.target.value)} placeholder="Görev başlığı" required/>
+                    </div>
+                    
+                    {/* NOVI RED ZA PRIORITET I ROK */}
+                    <div style={{display:'flex', gap:'15px'}}>
+                        <div className="form-group" style={{flex: 1}}>
+                            <label>Öncelik (Priority)</label>
+                            <select className="form-input" value={taskPriority} onChange={(e)=>setTaskPriority(e.target.value)}>
+                                <option value="High">🔴 Yüksek (High)</option>
+                                <option value="Normal">🟡 Normal</option>
+                                <option value="Low">🟢 Düşük (Low)</option>
+                            </select>
+                        </div>
+                        <div className="form-group" style={{flex: 1}}>
+                            <label>Son Tarih (Deadline)</label>
+                            <input type="date" className="form-input" value={taskDeadline} onChange={(e)=>setTaskDeadline(e.target.value)} />
+                        </div>
+                    </div>
+
+                    <div className="form-group">
+                      <label>Atanan Kişi (Assigned to)</label>
+                      <input className="form-input" value={taskAssignedTo} onChange={(e) => setTaskAssignedTo(e.target.value)} placeholder="Örn: Jones, Smith" />
+                    </div>
+
+                    <div className="form-group">
+                      <label>Açıklama</label>
+                      <textarea className="form-input textarea" value={taskDesc} onChange={(e) => setTaskDesc(e.target.value)} placeholder="Görev detayları" required/>
+                    </div>
+                    <div className="form-group">
+                      <label>Görev Görseli</label>
+                      <input ref={taskFileRef} type="file" accept="image/*" onChange={(e) => setTaskFile(e.target.files?.[0] || null)} />
+                    </div>
+                    <button className="btn-primary">Görevi Kaydet</button>
+                  </form>
+                </div>
+              </div>
+
+              <h3>Görevler</h3>
+              <div className="tasks-grid">
+                {tasksList.length > 0 ? (
+                  tasksList.map((t) => (
+                  <div key={t.id} className="task-card">
+                    {editingTaskId === t.id ? (
+                      <div className="edit-container" style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                        <div className="form-group">
+                          <label style={{fontSize: '0.8rem'}}>Başlığı Güncelle</label>
+                          <input className="form-input" value={editTitle} onChange={(e) => setEditTitle(e.target.value)} />
+                        </div>
+                        <div style={{display:'flex', gap:'10px'}}>
+                            <div className="form-group" style={{flex: 1}}>
+                                <label style={{fontSize: '0.8rem'}}>Öncelik</label>
+                                <select className="form-input" value={editPriority} onChange={(e)=>setEditPriority(e.target.value)}>
+                                    <option value="High">High</option>
+                                    <option value="Normal">Normal</option>
+                                    <option value="Low">Low</option>
+                                </select>
+                            </div>
+                            <div className="form-group" style={{flex: 1}}>
+                                <label style={{fontSize: '0.8rem'}}>Son Tarih</label>
+                                <input type="date" className="form-input" value={editDeadline} onChange={(e)=>setEditDeadline(e.target.value)} />
+                            </div>
+                        </div>
+                        <div className="form-group">
+                          <label style={{fontSize: '0.8rem'}}>Atanan Kişi</label>
+                          <input className="form-input" value={editAssignedTo} onChange={(e) => setEditAssignedTo(e.target.value)} />
+                        </div>
+                        <div className="form-group">
+                          <label style={{fontSize: '0.8rem'}}>Açıklamayı Güncelle</label>
+                          <textarea className="form-input textarea" value={editDesc} onChange={(e) => setEditDesc(e.target.value)} />
+                        </div>
+                        <div style={{ display: 'flex', gap: '8px' }}>
+                          <button className="btn-primary" style={{ flex: 1 }}
+                            onClick={() => {
+                              handleUpdateTask(t.id, {
+                                  title: editTitle, description: editDesc, priority: editPriority, deadline: editDeadline, assigned_to: editAssignedTo, status: t.status
+                              });
+                              setEditingTaskId(null);
+                            }}>
+                            Kaydet (Sync)
+                          </button>
+                          <button className="btn-secondary" style={{ flex: 1, marginTop: 0 }} onClick={() => setEditingTaskId(null)}>İptal</button>
+                        </div>
+                      </div>
+                      ) : (
+                      <>
+                      <div className="task-card-top">
+                        <div style={{display:'flex', flexDirection:'column', gap:'5px'}}>
+                            <h4>#{t.id} - {t.title}</h4>
+                            <div style={{display:'flex', gap:'5px', flexWrap:'wrap'}}>
+                                {t.priority && <span className={`badge priority-${t.priority.toLowerCase()}`}>{t.priority}</span>}
+                                {t.status && <span className={`badge status-${t.status === 'Completed' ? 'done' : 'prog'}`}>{t.status}</span>}
+                            </div>
+                        </div>
+                        <div style={{ display: 'flex', gap: '5px' }}>
+                          <button className="nav-btn" style={{ minWidth: 'auto', padding: '5px 10px', fontSize: '0.8rem' }}
+                            onClick={() => {
+                              setEditingTaskId(t.id); setEditTitle(t.title); setEditDesc(t.description);
+                              setEditPriority(t.priority || 'Normal'); setEditDeadline(t.deadline || ''); setEditAssignedTo(t.assigned_to || '');
+                            }}>
+                            Düzenle
+                          </button>
+                          <button className="btn-small-danger" onClick={() => handleDeleteTask(t.id)}>Sil</button>
+                        </div>
+                      </div>
+                      
+                      {t.deadline && <p className="task-meta">📅 <strong>Son Tarih:</strong> {t.deadline}</p>}
+                      {t.assigned_to && <p className="task-meta">👤 <strong>Atanan:</strong> {t.assigned_to}</p>}
+                      
+                      {t.image_url && <img src={formatUrl(t.image_url)} alt="Görev" className="task-image" />}
+                      <p className="task-desc">{t.description}</p>
+                      
+                      {/* DUGME ZA ZAVRŠAVANJE ZADATKA */}
+                      {t.status !== 'Completed' && (
+                          <button className="btn-success-outline" onClick={() => handleMarkCompleted(t)} style={{marginTop:'10px', marginBottom:'10px'}}>
+                              ✔️ Tamamlandı İşaretle
+                          </button>
+                      )}
+
+                      <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '5px' }}>
+                        Versiyon (T/D): {t.title_updated_at?.toFixed(2)} / {t.desc_updated_at?.toFixed(2)}
+                      </div>
+
+                      <div className="comments-section">
+                        <span className="comments-title">Yorumlar</span>
+                        <div className="existing-comments">
+                          {t.comments?.length > 0 ? t.comments.map(c => (
+                            <div key={c.id} className="comment-chip">{c.text}</div>
+                          )) : <span className="empty-text">Henüz yorum yok.</span>}
+                        </div>
+                        <div className="comment-input-wrapper">
+                          <input className="comment-input" placeholder="Yorum yaz..." value={commentDrafts[t.id] || ''} onChange={(e) => setCommentDrafts(prev => ({ ...prev, [t.id]: e.target.value }))} />
+                          <button className="btn-comment-add" onClick={() => handleAddComment(t.id)}>Ekle</button>
+                        </div>
+                      </div>
+                    </>
+                  )}
+                </div>
+                ))
+              ) : <div className="empty-card">Henüz görev eklenmedi.</div>}
+              </div>
+            </>
+          ) : (
+            // PROFIL SEKCIJA (Tvoj sigurnosni zadatak)
+            <div className="profile-grid">
+              
+              <div className="profile-card main-info" style={{display:'flex', flexDirection:'column', alignItems:'center'}}>
+                <div className="profile-avatar-large">
+                  {userData?.profile_pic ? <img src={formatUrl(userData.profile_pic)} className="profile-photo" alt="Profil" /> : <span>{userData?.username?.charAt(0).toUpperCase()}</span>}
+                </div>
+                <div className="info-list" style={{textAlign:'center'}}>
+                  <p>Kullanıcı: <strong>{userData?.username}</strong></p>
+                  <p>E-posta: <strong>{userData?.email}</strong></p>
+                </div>
+
+                <div style={{width:'100%', marginTop:'20px', borderTop:'1px solid var(--border-color)', paddingTop:'20px'}}>
+                    <h4 style={{marginTop:0, textAlign:'center'}}>Profil Fotoğrafı Güncelle</h4>
+                    {profileMessage.text && <div className={`message-box ${profileMessage.type}`}>{profileMessage.text}</div>}
+                    <form onSubmit={handleProfilePicUpload} style={{display:'flex', flexDirection:'column', gap:'10px'}}>
+                        <input type="file" accept="image/*" ref={profileFileRef} className="form-input" onChange={(e)=>setProfileFile(e.target.files[0])} />
+                        <button className="btn-primary" type="submit">Yükle</button>
+                    </form>
+                    {userData?.profile_pic && (
+                        <button className="btn-small-danger" style={{width:'100%', marginTop:'10px', padding:'12px'}} onClick={handleProfilePicDelete}>
+                            Mevcut Fotoğrafı Sil
+                        </button>
+                    )}
+                </div>
+              </div>
+              
+              <div className="profile-card">
+                  <h3 style={{marginTop:0}}>Şifre Değiştir</h3>
+                  {passMessage.text && <div className={`message-box ${passMessage.type}`}>{passMessage.text}</div>}
+                  <form onSubmit={handlePasswordChange}>
+                      <div className="form-group">
+                          <label>Eski Şifre</label>
+                          <div className="field-with-toggle">
+                              <input type={showOldPass ? 'text':'password'} className="form-input" value={oldPass} onChange={(e)=>setOldPass(e.target.value)} required/>
+                              <button type="button" className="toggle-eye-btn" onClick={()=>setShowOldPass(!showOldPass)}>{showOldPass ? '🔒' : '👁️'}</button>
+                          </div>
+                      </div>
+                      <div className="form-group">
+                          <label>Yeni Şifre</label>
+                          <div className="field-with-toggle">
+                              <input type={showNewPass ? 'text':'password'} className="form-input" value={newPass} onChange={(e)=>setNewPass(e.target.value)} required/>
+                              <button type="button" className="toggle-eye-btn" onClick={()=>setShowNewPass(!showNewPass)}>{showNewPass ? '🔒' : '👁️'}</button>
+                          </div>
+                      </div>
+                      <div className="form-group">
+                          <label>Yeni Şifre (Tekrar)</label>
+                          <div className="field-with-toggle">
+                              <input type={showConfirmNewPass ? 'text':'password'} className="form-input" value={confirmNewPass} onChange={(e)=>setConfirmNewPass(e.target.value)} required/>
+                              <button type="button" className="toggle-eye-btn" onClick={()=>setShowConfirmNewPass(!showConfirmNewPass)}>{showConfirmNewPass ? '🔒' : '👁️'}</button>
+                          </div>
+                      </div>
+                      <button type="submit" className="btn-primary">Şifreyi Güncelle</button>
+                  </form>
+              </div>
+
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default App;
+
+
+
+
+
+////////////////////////////////////////////////////////////////////////////////
+/// FAJL: ../frontend/src/App.css
+////////////////////////////////////////////////////////////////////////////////
+
+:root {
+  --bg-color: #f4f7fb;
+  --bg-gradient: linear-gradient(180deg, #f8fbff 0%, #f4f7fb 100%);
+  --card-bg: rgba(255, 255, 255, 0.92);
+  --text-main: #1c1e21;
+  --text-muted: #667085;
+  --primary-color: #3498db;
+  --primary-hover: #2c80b9;
+  --border-color: #d9e1ea;
+  --input-bg: #ffffff;
+  --shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
+}
+
+body.dark-theme {
+  --bg-color: #0b0f14;
+  --bg-gradient: linear-gradient(180deg, #0b0f14 0%, #111827 100%);
+  --card-bg: rgba(17, 24, 39, 0.92);
+  --text-main: #f8fafc;
+  --text-muted: #cbd5e1;
+  --primary-color: #8e44ad;
+  --primary-hover: #7a3798;
+  --border-color: #263244;
+  --input-bg: #111827;
+  --shadow: 0 14px 34px rgba(0, 0, 0, 0.28);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg-gradient);
+  color: var(--text-main);
+  font-family: 'Segoe UI', Tahoma, sans-serif;
+  transition: background-color 0.25s ease, color 0.25s ease, background 0.25s ease;
+}
+
+button, input, textarea {
+  font: inherit;
+}
+
+button {
+  transition: transform 0.15s ease, background-color 0.2s ease, opacity 0.2s ease;
+}
+
+button:hover {
+  transform: translateY(-1px);
+}
+
+.app-container {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 42px 20px 60px;
+  min-height: 100vh;
+}
+
+.main-title {
+  text-align: center;
+  margin: 26px 0 36px;
+  font-size: clamp(2rem, 4vw, 2.65rem);
+  letter-spacing: -0.03em;
+}
+
+.theme-toggle-wrapper {
+  position: fixed;
+  top: 18px;
+  left: 18px;
+  z-index: 30;
+}
+
+.toggle-btn {
+  padding: 9px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border-color);
+  background: var(--card-bg);
+  color: var(--text-main);
+  cursor: pointer;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(10px);
+}
+
+.auth-card,
+.action-box,
+.task-card,
+.profile-card,
+.empty-card {
+  background: var(--card-bg);
+  padding: 28px;
+  border-radius: 20px;
+  box-shadow: var(--shadow);
+  border: 1px solid var(--border-color);
+  backdrop-filter: blur(10px);
+}
+
+.auth-card {
+  max-width: 560px;
+  margin: 0 auto;
+}
+
+.auth-panel {
+  margin-top: 4px;
+}
+
+.auth-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+  margin-bottom: 14px;
+}
+
+.auth-switch {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.dashboard-wrapper {
+  margin-top: 12px;
+}
+
+.nav-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 28px;
+  padding: 0 2px;
+}
+
+.nav-buttons {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.nav-btn {
+  padding: 10px 18px;
+  border: 1px solid var(--border-color);
+  background: var(--card-bg);
+  color: var(--text-main);
+  border-radius: 12px;
+  cursor: pointer;
+  min-width: 92px;
+}
+
+.nav-btn.active {
+  background: var(--primary-color);
+  color: #fff;
+  border-color: transparent;
+}
+
+.logout-btn {
+  padding: 10px 18px;
+  background: #e74c3c;
+  color: #fff;
+  border: none;
+  border-radius: 12px;
+  cursor: pointer;
+}
+
+.action-grid,
+.tasks-grid,
+.profile-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+  margin-bottom: 32px;
+}
+
+.action-grid.single-panel {
+  grid-template-columns: 1fr;
+}
+
+.wide-box {
+  width: 100%;
+}
+
+.profile-grid {
+  grid-template-columns: 1fr 1.15fr;
+}
+
+.form-group {
+  margin-bottom: 15px;
+  text-align: left;
+}
+
+.form-group label {
+  display: block;
+  font-weight: 700;
+  margin-bottom: 6px;
+  font-size: 0.92rem;
+}
+
+.form-input,
+textarea,
+input[type="file"] {
+  width: 100%;
+  padding: 12px 13px;
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  background: var(--input-bg);
+  color: var(--text-main);
+  outline: none;
+}
+
+.form-input:focus,
+textarea:focus,
+input[type="file"]:focus {
+  border-color: var(--primary-color);
+  box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.14);
+}
+
+textarea.form-input,
+textarea {
+  min-height: 112px;
+  resize: vertical;
+}
+
+.field-with-toggle {
+  position: relative;
+  width: 100%;
+}
+
+.field-with-toggle .form-input {
+  padding-right: 54px;
+}
+
+.toggle-eye-btn {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 1.05rem;
+  padding: 6px 8px;
+  color: var(--text-muted);
+}
+
+.toggle-eye-btn:hover {
+  transform: translateY(-50%);
+  opacity: 0.8;
+}
+
+.field-hint {
+  margin-top: 8px;
+  font-size: 0.86rem;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+
+.muted-text {
+  color: var(--text-muted);
+  margin-top: 6px;
+  line-height: 1.6;
+}
+
+.btn-primary,
+.btn-secondary,
+.btn-comment-add,
+.btn-small-danger,
+.link-button {
+  border: none;
+  border-radius: 12px;
+  cursor: pointer;
+}
+
+.btn-primary {
+  width: 100%;
+  padding: 12px;
+  background-color: var(--primary-color);
+  color: #fff;
+  font-weight: 700;
+}
+
+.btn-primary:hover {
+  background-color: var(--primary-hover);
+}
+
+.btn-secondary {
+  width: 100%;
+  padding: 12px;
+  background: #6c757d;
+  color: #fff;
+  font-weight: 700;
+  margin-top: 10px;
+}
+
+.btn-comment-add {
+  padding: 10px 14px;
+  background: var(--primary-color);
+  color: #fff;
+  font-weight: 700;
+}
+
+.btn-small-danger {
+  padding: 8px 12px;
+  background: #e74c3c;
+  color: #fff;
+}
+
+.link-button {
+  margin-top: 14px;
+  background: transparent;
+  color: var(--primary-color);
+  text-decoration: underline;
+  padding: 0;
+}
+
+.message-box {
+  padding: 11px 12px;
+  border-radius: 12px;
+  margin: 10px 0 14px;
+  text-align: center;
+  font-size: 0.92rem;
+  border: 1px solid transparent;
+  white-space: pre-line;
+}
+
+.message-box.error {
+  background: #fee2e2;
+  color: #b91c1c;
+  border-color: #fecaca;
+}
+
+.message-box.success {
+  background: #dcfce7;
+  color: #15803d;
+  border-color: #bbf7d0;
+}
+
+.profile-avatar-large {
+  width: 110px;
+  height: 110px;
+  background: var(--primary-color);
+  color: white;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 42px;
+  font-weight: 700;
+  margin: 0 auto 18px;
+  overflow: hidden;
+}
+
+.profile-photo {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.info-list {
+  margin-bottom: 18px;
+  line-height: 1.9;
+}
+
+.profile-upload-box {
+  margin-top: 18px;
+}
+
+.task-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  transition: transform 0.18s ease, box-shadow 0.18s ease;
+}
+
+.task-card:hover {
+  transform: translateY(-2px);
+}
+
+.task-card-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.task-image {
+  width: 100%;
+  max-height: 240px;
+  object-fit: cover;
+  border-radius: 14px;
+  border: 1px solid var(--border-color);
+}
+
+.task-desc {
+  color: var(--text-main);
+  margin: 0;
+  white-space: pre-wrap;
+  line-height: 1.65;
+}
+
+.comments-section {
+  margin-top: 6px;
+}
+
+.comments-title {
+  display: inline-block;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+
+.existing-comments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.comment-chip {
+  padding: 8px 10px;
+  border-radius: 999px;
+  background: rgba(127, 127, 127, 0.12);
+  border: 1px solid var(--border-color);
+  font-size: 0.9rem;
+}
+
+.empty-text {
+  color: var(--text-muted);
+  font-size: 0.92rem;
+}
+
+.comment-input-wrapper {
+  display: flex;
+  gap: 8px;
+}
+
+.comment-input {
+  flex: 1;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  background: var(--input-bg);
+  color: var(--text-main);
+}
+
+.empty-card {
+  grid-column: 1 / -1;
+  text-align: center;
+  color: var(--text-muted);
+  padding: 26px;
+}
+
+@media (max-width: 980px) {
+  .action-grid,
+  .tasks-grid,
+  .profile-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .nav-header,
+  .auth-top {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .nav-buttons,
+  .auth-switch {
+    width: 100%;
+  }
+
+  .logout-btn {
+    width: 100%;
+  }
+}
+
+.auth-subtitle {
+  text-align: center;
+  color: var(--text-muted);
+  margin-bottom: 18px;
+}
+
+.password-checklist {
+  margin-top: 10px;
+  font-size: 0.85rem;
+}
+
+.password-checklist div {
+  margin-bottom: 4px;
+}
+
+.password-checklist .ok {
+  color: #16a34a;
+}
+
+.password-checklist .fail {
+  color: #dc2626;
+}
+
+/* --- NOVI STILOVI ZA FATMINE ZADATKE --- */
+.badge {
+  display: inline-block;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.priority-high { background-color: #fee2e2; color: #b91c1c; border: 1px solid #fca5a5; }
+.priority-normal { background-color: #fef9c3; color: #a16207; border: 1px solid #fde047; }
+.priority-low { background-color: #dcfce7; color: #15803d; border: 1px solid #86efac; }
+
+.status-prog { background-color: #e0f2fe; color: #0369a1; border: 1px solid #7dd3fc; }
+.status-done { background-color: #d1fae5; color: #047857; border: 1px solid #6ee7b7; }
+
+.task-meta {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  margin: 2px 0;
+}
+
+.btn-success-outline {
+  width: 100%;
+  padding: 10px;
+  background: transparent;
+  color: #10b981;
+  border: 2px solid #10b981;
+  border-radius: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-success-outline:hover {
+  background: #10b981;
+  color: white;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// FAJL: ../frontend/src/main.jsx
+////////////////////////////////////////////////////////////////////////////////
+
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import './index.css'
+import App from './App.jsx'
+
+createRoot(document.getElementById('root')).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+)
+
+////////////////////////////////////////////////////////////////////////////////
+/// FAJL: ../frontend/index.html
+////////////////////////////////////////////////////////////////////////////////
+
+<!doctype html>
+<html lang="tr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Görev Yöneticisi</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>✔️</text></svg>"
+    />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
