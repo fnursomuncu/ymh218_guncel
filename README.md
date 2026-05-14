@@ -48,3 +48,41 @@ Bu proje, modern web teknolojileri kullanılarak geliştirilmiş, güvenli ve ö
 │   ├── index.html         # Ana HTML dosyası
 │   ├── package.json       # Bağımlılıklar ve scriptler
 │   └── vite.config.js     # Vite yapılandırması
+
+## 🚀 Kurulum ve Başlatma
+
+Projenin yerel ortamınızda çalışması için aşağıdaki adımları sırasıyla takip edin.
+
+### 1. Backend Kurulumu
+
+Backend dizinine gidin ve gerekli bağımlılıkları yükleyin:
+
+```bash
+# Klasöre giriş yapın
+cd backend
+
+# Python sanal ortamını oluşturun
+python -m venv venv
+
+# Sanal ortamı aktif edin
+# Windows için:
+venv\Scripts\activate
+# macOS/Linux için:
+source venv/bin/activate
+
+# Gerekli kütüphaneleri yükleyin
+pip install -r requirements.txt
+
+## Sunucuyu Başlatma
+uvicorn main:app --reload
+
+### 2. Frontend Kurulumu
+# Klasöre giriş yapın
+cd frontend
+
+# Bağımlılıkları yükleyin (NPM veya Yarn)
+npm install
+
+## Uygulama Başlatma
+# Geliştirme sunucusunu çalıştırın
+npm run dev
