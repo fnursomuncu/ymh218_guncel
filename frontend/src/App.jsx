@@ -369,6 +369,9 @@ function App() {
       title_updated_at: now,
       desc_updated_at: now
     };
+    setTasksList((prev) => 
+      prev.map((t) => (t.id === taskId ? { ...t, ...finalData } : t))
+    );
 
     const res = await fetch(`${API_BASE}/tasks/sync`, {
       method: 'POST',
@@ -377,8 +380,6 @@ function App() {
     });
 
     if (res.ok) {
-      void fetchTasks();
-      void fetchStats();
       notifyTaskChange();
     } else {
       toast.error(await readError(res, 'Güncelleme başarısız.'));
@@ -386,28 +387,54 @@ function App() {
   };
 
   const handleMarkCompleted = async (task) => {
+    const now = Date.now() / 1000;
+
+    setTasksList((prev) => 
+      prev.map((t) => (t.id === task.id ? { 
+        ...t, 
+        status: 'Completed', 
+        title_updated_at: now,
+        completed_at: new Date().toISOString() 
+      } : t))
+    );
+
     const res = await fetch(`${API_BASE}/tasks/${task.id}/complete`, {
       method: 'POST',
       headers: authHeaders(),
     });
     if (res.ok) {
-      void fetchTasks(); void fetchStats(); notifyTaskChange();
+      void fetchStats(); 
+      notifyTaskChange();
       toast.success(`#${task.id} tamamlandı olarak işaretlendi.`);
     } else {
       toast.error(await readError(res, 'İşlem başarısız.'));
+      void fetchTasks(); // Eğer hata olursa ekranı eski gerçek haline döndür
     }
   };
-
   const handleReopenTask = async (task) => {
+    const now = Date.now() / 1000;
+
+    setTasksList((prev) => 
+      prev.map((t) => (t.id === task.id ? { 
+        ...t, 
+        status: 'In-Progress', 
+        title_updated_at: now,
+        completed_at: null 
+      } : t))
+    );
+
     const res = await fetch(`${API_BASE}/tasks/${task.id}/reopen`, {
       method: 'POST',
       headers: authHeaders(),
     });
     if (res.ok) {
-      void fetchTasks(); void fetchStats(); notifyTaskChange();
+      void fetchTasks();
+      void fetchStats(); 
+      notifyTaskChange();
       toast.success(`#${task.id} yeniden açıldı.`);
     } else {
       toast.error(await readError(res, 'İşlem başarısız.'));
+      void fetchTasks(); // Hata olursa geri al
     }
   };
 
