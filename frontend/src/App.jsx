@@ -6,24 +6,32 @@ const API_BASE = 'http://127.0.0.1:8000';
 const PASSWORD_POLICY = 'Şifre en az 8 karakter olmalı; 1 büyük harf, 1 küçük harf, 1 rakam ve 1 özel karakter içermelidir.';
 
 // --- CRDT MERGE FONKSİYONU (Popravljeno za brisanje) ---
+// --- CRDT MERGE FONKSİYONU ---
 const mergeTasks = (localTasks, incomingTasks) => {
   const localMap = new Map(localTasks.map(t => [t.id, t]));
 
-  // Sada prolazimo SAMO kroz zadatke koji su zaista stigli sa backenda
   return incomingTasks.map(incoming => {
     if (localMap.has(incoming.id)) {
       const local = localMap.get(incoming.id);
       const merged = { ...local };
 
-      // LWW (Last-Write-Wins) Mantığı
+      // 1. ÖZEL DURUM ÇÖZÜMÜ: Eğer durum (status) değiştiyse, zaman damgasını sormadan doğrudan kabul et!
+      if (incoming.status !== local.status) {
+        merged.status = incoming.status;
+        merged.completed_at = incoming.completed_at;
+      }
+
+      // 2. LWW (Last-Write-Wins) Mantığı - Başlık, Öncelik vs. değişiklikleri için
       if (incoming.title_updated_at > (local.title_updated_at || 0)) {
         merged.title = incoming.title;
         merged.title_updated_at = incoming.title_updated_at;
         merged.priority = incoming.priority;
-        merged.status = incoming.status;
+        merged.status = incoming.status; // Garanti olsun
         merged.deadline = incoming.deadline;
         merged.assigned_to = incoming.assigned_to;
+        merged.completed_at = incoming.completed_at;
       }
+      
       if (incoming.desc_updated_at > (local.desc_updated_at || 0)) {
         merged.description = incoming.description;
         merged.desc_updated_at = incoming.desc_updated_at;
@@ -33,7 +41,7 @@ const mergeTasks = (localTasks, incomingTasks) => {
       merged.comments = incoming.comments;
       return merged;
     } else {
-      // Ako je zadatak potpuno nov, samo ga dodaj
+      // Görev yepyeni ise direkt ekle
       return incoming;
     }
   }).sort((a, b) => b.id - a.id);
@@ -74,6 +82,7 @@ function App() {
   const [filterPriority, setFilterPriority] = useState('All');
   const [filterStatus, setFilterStatus] = useState('All');
   const [searchQuery, setSearchQuery] = useState('');
+  const [sortBy, setSortBy] = useState('Default'); // Yeni Sıralama state'imiz
   const [stats, setStats] = useState(null);
   const importFileRef = useRef(null);
 
@@ -216,6 +225,8 @@ function App() {
           if (message.payload && message.payload.action === 'task_changed') {
               // Görevleri yenile
               fetchTasks();
+
+              fetchStats();
               
               // Herhangi bir temada güzel görünen standart başarılı bildirimini göster
               toast.success('Bir görev güncellendi!', {
@@ -532,7 +543,8 @@ function App() {
   const currentPasswordIssues = getPasswordIssues(regPassword);
   const newPasswordIssues = getPasswordIssues(newPass);
 
-  const filteredTasks = tasksList.filter((t) => {
+  // Önce görevleri mevcut mantıkla filtreliyoruz
+  let processedTasks = tasksList.filter((t) => {
     if (filterPriority !== 'All' && t.priority !== filterPriority) return false;
     if (filterStatus !== 'All' && t.status !== filterStatus) return false;
     if (searchQuery.trim()) {
@@ -542,6 +554,25 @@ function App() {
       if (!inText && !inAssignee) return false;
     }
     return true;
+  });
+
+  // Sonra seçilen kritere göre SIRALIYORUZ
+  const filteredTasks = processedTasks.sort((a, b) => {
+    if (sortBy === 'Priority') {
+      // High > Normal > Low mantığı için ağırlık veriyoruz
+      const priorityWeights = { 'High': 3, 'Normal': 2, 'Low': 1 };
+      const weightA = priorityWeights[a.priority] || 0;
+      const weightB = priorityWeights[b.priority] || 0;
+      return weightB - weightA; // Büyükten küçüğe sırala
+    } 
+    else if (sortBy === 'Deadline') {
+      // Tarihi olmayanları (null) en sona atıyoruz
+      if (!a.deadline) return 1;
+      if (!b.deadline) return -1;
+      return new Date(a.deadline) - new Date(b.deadline); // En yakın tarih en üstte
+    }
+    // Varsayılan: Yeniden eskiye göre sırala (ID'ye göre)
+    return b.id - a.id;
   });
 
   const tasksByStatus = {
@@ -733,18 +764,28 @@ function App() {
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                 />
+                
+                {/* YENİ SIRALAMA MENÜSÜ */}
+                <select className="form-input" style={{ flex: 1, minWidth: 140 }} value={sortBy} onChange={(e) => setSortBy(e.target.value)}>
+                  <option value="Default">Sıralama: Yeniden Eskiye</option>
+                  <option value="Priority">Sıralama: Önce Yüksek Öncelik</option>
+                  <option value="Deadline">Sıralama: Yaklaşan Teslim Tarihi</option>
+                </select>
+
                 <select className="form-input" style={{ flex: 1, minWidth: 140 }} value={filterPriority} onChange={(e) => setFilterPriority(e.target.value)}>
                   <option value="All">Öncelik: Tümü</option>
                   <option value="High">🔴 High</option>
                   <option value="Normal">🟡 Normal</option>
                   <option value="Low">🟢 Low</option>
                 </select>
+
                 <select className="form-input" style={{ flex: 1, minWidth: 140 }} value={filterStatus} onChange={(e) => setFilterStatus(e.target.value)}>
                   <option value="All">Durum: Tümü</option>
                   <option value="To-Do">📋 To-Do</option>
                   <option value="In-Progress">⚙️ In-Progress</option>
                   <option value="Completed">✅ Completed</option>
                 </select>
+
                 <button className="nav-btn" onClick={handleExportTasks} title="JSON olarak dışa aktar">⬇ Export</button>
                 <button className="nav-btn" onClick={() => importFileRef.current?.click()} title="JSON içe aktar">⬆ Import</button>
                 <input ref={importFileRef} type="file" accept="application/json,.json" style={{ display: 'none' }} onChange={handleImportTasks} />
