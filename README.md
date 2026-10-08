@@ -127,6 +127,7 @@ Uygulama varsayılan olarak `http://localhost:5173` adresinde açılır.
 
 <!-- Ekip üyelerinin isimlerini aşağıya ekleyin -->
 
-- Ad Soyad
-- Ad Soyad
-- Ad Soyad
+- Fatma Nur Somuncu
+- Efe Uzunsoy
+- Sara Memisevic
+- Wafa Al-Sabahi
